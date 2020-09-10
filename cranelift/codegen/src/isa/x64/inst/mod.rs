@@ -1,5 +1,4 @@
-//! This module defines x86_64-specific machine instruction types.an explanation of what it's
-//! doing.
+//! This module defines x86_64-specific machine instruction types.
 #![allow(dead_code)]
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
@@ -56,6 +55,18 @@ pub enum Inst {
         dst: Writable<Reg>,
     },
 
+    /// Bitwise not
+    Not {
+        size: u8, // 1, 2, 4 or 8
+        src: Writable<Reg>,
+    },
+
+    /// Integer negation
+    Neg {
+        size: u8, // 1, 2, 4 or 8
+        src: Writable<Reg>,
+    },
+
     /// Integer quotient and remainder: (div idiv) $rax $rdx (reg addr)
     Div {
         size: u8, // 1, 2, 4 or 8
@@ -89,7 +100,8 @@ pub enum Inst {
     },
 
     /// Do a sign-extend based on the sign of the value in rax into rdx: (cwd cdq cqo)
-    SignExtendRaxRdx {
+    /// or al into ah: (cbw)
+    SignExtendData {
         size: u8, // 1, 2, 4 or 8
     },
 
@@ -151,9 +163,9 @@ pub enum Inst {
         srcloc: Option<SourceLoc>,
     },
 
-    /// Arithmetic shifts: (shl shr sar) (l q) imm reg.
+    /// Arithmetic shifts: (shl shr sar) (b w l q) imm reg.
     Shift_R {
-        is_64: bool,
+        size: u8, // 1, 2, 4 or 8
         kind: ShiftKind,
         /// shift count: Some(0 .. #bits-in-type - 1), or None to mean "%cl".
         num_bits: Option<u8>,
@@ -512,6 +524,18 @@ impl Inst {
         Self::UnaryRmR { size, op, src, dst }
     }
 
+    pub(crate) fn not(size: u8, src: Writable<Reg>) -> Inst {
+        debug_assert_eq!(src.to_reg().get_class(), RegClass::I64);
+        debug_assert!(size == 8 || size == 4 || size == 2 || size == 1);
+        Inst::Not { size, src }
+    }
+
+    pub(crate) fn neg(size: u8, src: Writable<Reg>) -> Inst {
+        debug_assert_eq!(src.to_reg().get_class(), RegClass::I64);
+        debug_assert!(size == 8 || size == 4 || size == 2 || size == 1);
+        Inst::Neg { size, src }
+    }
+
     pub(crate) fn div(size: u8, signed: bool, divisor: RegMem, loc: SourceLoc) -> Inst {
         divisor.assert_regclass_is(RegClass::I64);
         debug_assert!(size == 8 || size == 4 || size == 2 || size == 1);
@@ -550,9 +574,9 @@ impl Inst {
         }
     }
 
-    pub(crate) fn sign_extend_rax_to_rdx(size: u8) -> Inst {
-        debug_assert!(size == 8 || size == 4 || size == 2);
-        Inst::SignExtendRaxRdx { size }
+    pub(crate) fn sign_extend_data(size: u8) -> Inst {
+        debug_assert!(size == 8 || size == 4 || size == 2 || size == 1);
+        Inst::SignExtendData { size }
     }
 
     pub(crate) fn imm_r(dst_is_64: bool, simm64: u64, dst: Writable<Reg>) -> Inst {
@@ -861,19 +885,20 @@ impl Inst {
     }
 
     pub(crate) fn shift_r(
-        is_64: bool,
+        size: u8,
         kind: ShiftKind,
         num_bits: Option<u8>,
         dst: Writable<Reg>,
     ) -> Inst {
+        debug_assert!(size == 8 || size == 4 || size == 2 || size == 1);
         debug_assert!(if let Some(num_bits) = num_bits {
-            num_bits < if is_64 { 64 } else { 32 }
+            num_bits < size * 8
         } else {
             true
         });
         debug_assert!(dst.to_reg().get_class() == RegClass::I64);
         Inst::Shift_R {
-            is_64,
+            size,
             kind,
             num_bits,
             dst,
@@ -1101,7 +1126,9 @@ impl Inst {
 
             Self::XMM_RM_R { op, src, dst, .. } => {
                 src.to_reg() == Some(dst.to_reg())
-                    && (*op == SseOpcode::Xorps || *op == SseOpcode::Xorpd)
+                    && (*op == SseOpcode::Xorps
+                        || *op == SseOpcode::Xorpd
+                        || *op == SseOpcode::Pxor)
             }
 
             Self::XmmRmRImm { op, src, dst, imm } => {
@@ -1178,6 +1205,18 @@ impl ShowWithRRU for Inst {
                 show_ireg_sized(dst.to_reg(), mb_rru, *size),
             ),
 
+            Inst::Not { size, src } => format!(
+                "{} {}",
+                ljustify2("not".to_string(), suffixBWLQ(*size)),
+                show_ireg_sized(src.to_reg(), mb_rru, *size)
+            ),
+
+            Inst::Neg { size, src } => format!(
+                "{} {}",
+                ljustify2("neg".to_string(), suffixBWLQ(*size)),
+                show_ireg_sized(src.to_reg(), mb_rru, *size)
+            ),
+
             Inst::Div {
                 size,
                 signed,
@@ -1221,7 +1260,8 @@ impl ShowWithRRU for Inst {
                 show_ireg_sized(divisor.to_reg(), mb_rru, *size),
             ),
 
-            Inst::SignExtendRaxRdx { size } => match size {
+            Inst::SignExtendData { size } => match size {
+                1 => "cbw",
                 2 => "cwd",
                 4 => "cdq",
                 8 => "cqo",
@@ -1464,22 +1504,22 @@ impl ShowWithRRU for Inst {
             ),
 
             Inst::Shift_R {
-                is_64,
+                size,
                 kind,
                 num_bits,
                 dst,
             } => match num_bits {
                 None => format!(
                     "{} %cl, {}",
-                    ljustify2(kind.to_string(), suffixLQ(*is_64)),
-                    show_ireg_sized(dst.to_reg(), mb_rru, sizeLQ(*is_64))
+                    ljustify2(kind.to_string(), suffixBWLQ(*size)),
+                    show_ireg_sized(dst.to_reg(), mb_rru, *size)
                 ),
 
                 Some(num_bits) => format!(
                     "{} ${}, {}",
-                    ljustify2(kind.to_string(), suffixLQ(*is_64)),
+                    ljustify2(kind.to_string(), suffixBWLQ(*size)),
                     num_bits,
-                    show_ireg_sized(dst.to_reg(), mb_rru, sizeLQ(*is_64))
+                    show_ireg_sized(dst.to_reg(), mb_rru, *size)
                 ),
             },
 
@@ -1643,9 +1683,19 @@ fn x64_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
                 collector.add_mod(*dst);
             }
         }
-        Inst::Div { divisor, .. } => {
+        Inst::Not { src, .. } => {
+            collector.add_mod(*src);
+        }
+        Inst::Neg { src, .. } => {
+            collector.add_mod(*src);
+        }
+        Inst::Div { size, divisor, .. } => {
             collector.add_mod(Writable::from_reg(regs::rax()));
-            collector.add_mod(Writable::from_reg(regs::rdx()));
+            if *size == 1 {
+                collector.add_def(Writable::from_reg(regs::rdx()));
+            } else {
+                collector.add_mod(Writable::from_reg(regs::rdx()));
+            }
             divisor.get_regs_as_uses(collector);
         }
         Inst::MulHi { rhs, .. } => {
@@ -1664,10 +1714,14 @@ fn x64_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
                 collector.add_def(*tmp);
             }
         }
-        Inst::SignExtendRaxRdx { .. } => {
-            collector.add_use(regs::rax());
-            collector.add_def(Writable::from_reg(regs::rdx()));
-        }
+        Inst::SignExtendData { size } => match size {
+            1 => collector.add_mod(Writable::from_reg(regs::rax())),
+            2 | 4 | 8 => {
+                collector.add_use(regs::rax());
+                collector.add_def(Writable::from_reg(regs::rdx()));
+            }
+            _ => unreachable!(),
+        },
         Inst::UnaryRmR { src, dst, .. } | Inst::XmmUnaryRmR { src, dst, .. } => {
             src.get_regs_as_uses(collector);
             collector.add_def(*dst);
@@ -1959,6 +2013,7 @@ fn x64_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
                 map_mod(mapper, dst);
             }
         }
+        Inst::Not { src, .. } | Inst::Neg { src, .. } => map_mod(mapper, src),
         Inst::Div { divisor, .. } => divisor.map_uses(mapper),
         Inst::MulHi { rhs, .. } => rhs.map_uses(mapper),
         Inst::CheckedDivOrRemSeq { divisor, tmp, .. } => {
@@ -1967,7 +2022,7 @@ fn x64_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
                 map_def(mapper, tmp)
             }
         }
-        Inst::SignExtendRaxRdx { .. } => {}
+        Inst::SignExtendData { .. } => {}
         Inst::XmmUnaryRmR {
             ref mut src,
             ref mut dst,
@@ -2442,7 +2497,7 @@ impl MachInstEmit for Inst {
 }
 
 impl MachInstEmitState<Inst> for EmitState {
-    fn new(abi: &dyn ABIBody<I = Inst>) -> Self {
+    fn new(abi: &dyn ABICallee<I = Inst>) -> Self {
         EmitState {
             virtual_sp_offset: 0,
             nominal_sp_to_fp: abi.frame_size() as i64,
